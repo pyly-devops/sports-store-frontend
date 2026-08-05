@@ -135,9 +135,50 @@ jobs:
             docker push "$image"
           fi
 
-          # Until Milestone 7 a human copies this into the gateway repo's
-          # FRONTEND_IMAGE_TAG (one line, one PR) and into the deployments
-          # repo's environments/production/images/frontend.yaml. Putting it on
-          # the run summary is the difference between a 30-second manual step
-          # and digging through a log for it.
+          # dispatch-gateway (below) fires the event that replaces the human
+          # copying this into the gateway repo's FRONTEND_IMAGE_TAG. There is
+          # and must never be a sports-store-deployments/environments/
+          # production/images/frontend.yaml — the frontend is baked into the
+          # gateway image at build time, never deployed as its own Helm
+          # service, so it has no image-tag file of its own to write.
           echo "Pushed \`$TAG\` to \`$ECR_REPOSITORY\`" >> "$GITHUB_STEP_SUMMARY"
+
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+
+  # Fires a repository_dispatch at the gateway repo carrying the tag that was
+  # just pushed. Separate job, same reasoning as bump-deployment elsewhere:
+  # publish's AWS identity and this job's cross-repo dispatch identity stay on
+  # different runners.
+  dispatch-gateway:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: {} # GITHUB_TOKEN cannot dispatch into another repo's default-branch workflow at any permission level.
+    steps:
+      # Mints a token scoped to exactly this App's installation on
+      # sports-store-gateway — the App is also installed on
+      # sports-store-deployments for the other five repos' bump-deployment
+      # flow, which this job doesn't touch.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.DEPLOY_BOT_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_BOT_PRIVATE_KEY }}
+          owner: pyly-devops
+          repositories: sports-store-gateway
+
+      # repository_dispatch only ever runs the workflow file on the
+      # TARGET repo's default branch — frontend-bump.yml must already be
+      # merged to gateway main before this ever fires, or the event lands on
+      # nothing with no error anywhere. That ordering is why this PR is step
+      # 5 of two, sequenced after the gateway PR, not parallel with it.
+      - name: Dispatch to sports-store-gateway
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api repos/pyly-devops/sports-store-gateway/dispatches \
+            -f event_type=frontend-image \
+            -f "client_payload[tag]=${TAG}"
