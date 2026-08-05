@@ -1,0 +1,33 @@
+# This file is load-bearing, not hygiene. It changes what the build PRODUCES.
+#
+# The Dockerfile does `COPY package.json package-lock.json ./` -> `npm ci` ->
+# `COPY . .`. Without `node_modules/` excluded, that second copy drops the
+# HOST's node_modules straight on top of the tree `npm ci` just built from the
+# lockfile - silently replacing a reproducible install with whatever is on the
+# developer's disk, possibly built for a different architecture, and busting
+# the layer cache on every build.
+#
+# `dist/` matters for the same reason: a stale host build would be copied in
+# and then overwritten by `npm run build`, which is merely wasteful - but if
+# the build ever failed, the stale bundle is what would ship.
+
+node_modules/
+dist/
+build/
+.vite/
+
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+
+coverage/
+*.log
+npm-debug.log*
+
+# Never let local environment files into an image. The bundle needs none of
+# them - there are no VITE_* variables in this app by design - so anything
+# matching here would be a mistake travelling to a registry.
+.env
+.env.*
