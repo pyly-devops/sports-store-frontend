@@ -1,12 +1,20 @@
-# CI for the frontend build-artifact image (Milestone 6).
+# CI for the frontend build-artifact image (Milestone 6) and, since Milestone
+# 9, for the S3 + CloudFront static deploy.
 #
-# Two jobs, and the split between them is the security boundary:
+# The split between the jobs is the security boundary:
 #
-#   verify   runs on every pull request AND on every push to main. It holds
-#            `contents: read` and nothing else, so it cannot even ask for an
-#            OIDC token, let alone reach AWS.
-#   publish  runs only on main, only after verify passed, and is the only job
-#            in this repo that requests `id-token: write`.
+#   verify         runs on every pull request AND on every push to main. It
+#                  holds `contents: read` and nothing else, so it cannot even
+#                  ask for an OIDC token, let alone reach AWS. Every guard
+#                  lives here for that reason.
+#   publish        runs only on main, only after verify passed. Pushes the
+#                  build-artifact image to ECR.
+#   deploy-static  runs only on main, only after publish. Uploads the same
+#                  bundle to S3 and invalidates CloudFront. Skips entirely
+#                  until vars.FRONTEND_BUCKET is set.
+#
+# publish and deploy-static are the only jobs in this repo that request
+# `id-token: write`, and they assume the same single role.
 #
 # What actually stops a pull request from publishing is not the `if:` below -
 # it is the trust policy on github-actions-sports-store-frontend-ecr-push,
@@ -54,6 +62,59 @@ jobs:
       # PR's clothes (Milestone 6 plan §4d). Recorded as a named gap, not
       # pretended away.
       - run: npm run build
+
+      # ------------------------------------------------------------------
+      # Guard — the API base must stay ROOT-RELATIVE (Milestone 9).
+      #
+      # src/api.js calls fetch(`/api${path}`), with no scheme and no host. The
+      # entire CloudFront design depends on that staying true: because the URL
+      # is root-relative the browser sends API calls to whatever origin served
+      # the page, which is what lets ONE distribution serve the SPA from S3
+      # and pass /api/* through to the ALB.
+      #
+      # If someone introduces a VITE_API_URL or any absolute base, Vite inlines
+      # it at build time, the browser starts calling the ALB directly, and the
+      # app breaks in the least helpful way available: CORS errors and a
+      # bypassed CDN, which look like a CloudFront misconfiguration rather than
+      # a frontend change. This catches it on the PR that introduces it.
+      #
+      # Runs on every PR and needs no AWS credentials — it only reads dist/.
+      # Same guard-in-CI style as sports-store-deployments' chart.yml
+      # ("Guard — no :latest", "Guard — no placeholder AWS account IDs").
+      # ------------------------------------------------------------------
+      - name: Guard — the API base must stay root-relative
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          files = sorted(pathlib.Path("dist").rglob("*.js"))
+          index = pathlib.Path("dist/index.html")
+          if index.exists():
+              files.append(index)
+          blob = "\n".join(f.read_text(errors="replace") for f in files)
+
+          # A. The call site has to still exist, or B passes vacuously and the
+          #    guard silently stops guarding anything.
+          if "/api" not in blob:
+              sys.exit("::error::No '/api' found in the built bundle. "
+                       "src/api.js should call fetch(`/api${path}`); if that "
+                       "moved, this guard has to move with it.")
+
+          # B. ...and it must not have grown a scheme and host in front of it.
+          #    The character class stops the match running across a quote or a
+          #    backtick: the bundle legitimately contains absolute URLs
+          #    (images.unsplash.com, w3.org XML namespaces), and without the
+          #    boundary a greedy match would join one of those to the unrelated
+          #    /api later on the same minified line.
+          bad = sorted(set(re.findall(r"https?://[^\"'`\s]*/api", blob)))
+          if bad:
+              for hit in bad:
+                  print(f"::error::Absolute API URL in the built bundle: {hit}")
+              sys.exit("The API base must stay root-relative — see the comment "
+                       "above this step in ci.yml.")
+
+          print("OK: the API base is root-relative.")
+          PY
 
       - run: docker build --platform linux/amd64 -t ci:${{ github.sha }} .
 
@@ -145,6 +206,122 @@ jobs:
 
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+
+  # ==========================================================================
+  # Milestone 9 — publish the same bundle to S3, behind CloudFront.
+  #
+  # ADDITIVE. `publish` and `dispatch-gateway` are untouched: the gateway still
+  # bakes the bundle into its own image, so the ALB health check (which hits
+  # the gateway's `/`) and the M7 dispatch chain keep working, and the direct
+  # ALB URL stays a real fallback. What changes is only where BROWSERS fetch
+  # the static assets from.
+  #
+  # WHY THE `vars.FRONTEND_BUCKET != ''` GATE:
+  #
+  # The infrastructure side ships with enable_cloudfront = false, so the bucket
+  # and distribution do not exist yet and the two variables below are unset.
+  # Without this condition every merge to main would fail here — a red X on
+  # main for a milestone that is not finished being provisioned. With it, the
+  # job SKIPS until someone sets the variables from the Terraform outputs
+  # (frontend_bucket_name, cloudfront_distribution_id), and starts working the
+  # moment they do. No further code change to turn it on.
+  # ==========================================================================
+  deploy-static:
+    needs: publish
+    if: github.ref == 'refs/heads/main' && vars.FRONTEND_BUCKET != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      BUCKET: ${{ vars.FRONTEND_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The SAME role `publish` uses, extended by cloudfront.tf with s3:Put/
+      # Delete on this one bucket and cloudfront:CreateInvalidation on this one
+      # distribution. No new role, no new trust policy, no static keys.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-sports-store-frontend-ecr-push
+          aws-region: us-east-1 # matches envs/prod/variables.tf
+
+      # Extracted from the image rather than rebuilt with `npm run build`.
+      # Same trick `verify` already uses, and here it buys a real guarantee:
+      # S3 and the gateway image serve byte-identical bundles, so the
+      # CloudFront URL and the direct-ALB fallback URL can never drift into
+      # showing two different versions of the app.
+      - name: Extract the exact bundle the image ships
+        run: docker build --output type=local,dest=./out .
+
+      # THREE PASSES, IN THIS ORDER. Cache headers differ per file class, and
+      # `aws s3 sync` applies one --cache-control to everything it copies.
+      #
+      # Getting the order wrong is the classic way to ship a broken deploy: a
+      # viewer who fetches the new index.html before the assets it references
+      # have landed gets a white screen, and index.html is the one file that is
+      # not cached, so they get it immediately.
+      - name: 1/3 — hashed assets, cached for a year
+        run: |
+          set -euo pipefail
+          # Safe to call immutable ONLY because Vite content-hashes these
+          # filenames (index-CHJp0UD_.js). A new build produces a new name, so
+          # a year-long cache can never serve stale code — it just stops being
+          # referenced.
+          aws s3 sync out/dist/assets/ "s3://$BUCKET/assets/" \
+            --cache-control "public,max-age=31536000,immutable" \
+            --no-progress
+
+      - name: 2/3 — unhashed root files, cached briefly
+        run: |
+          set -euo pipefail
+          # favicon.svg, robots.txt, site.webmanifest. These keep their names
+          # across builds, so `immutable` would pin a stale copy for a year.
+          # Five minutes is long enough to be worth caching and short enough to
+          # fix by waiting.
+          aws s3 sync out/dist/ "s3://$BUCKET/" \
+            --exclude "assets/*" --exclude "index.html" \
+            --cache-control "public,max-age=300" \
+            --no-progress
+
+      - name: 3/3 — index.html, never cached, uploaded last
+        run: |
+          set -euo pipefail
+          # no-cache means "revalidate before use", not "do not store". This is
+          # the file that names the current hashed assets, so it is the one
+          # thing that must never be served stale.
+          #
+          # Uploaded LAST so it only ever points at assets already in place.
+          aws s3 cp out/dist/index.html "s3://$BUCKET/index.html" \
+            --cache-control "no-cache" \
+            --content-type "text/html" \
+            --no-progress
+
+      # NOTE: no --delete on any pass, deliberately. Old hashed assets are left
+      # behind so a browser mid-session — one that loaded the previous
+      # index.html and has not reloaded — can still fetch the chunks it was
+      # told about. They are ~200 KB per deploy and cost fractions of a cent;
+      # deleting them to save that would break real sessions on every merge.
+
+      - name: Invalidate the entry document
+        run: |
+          set -euo pipefail
+          # Only these two paths, NOT "/*". The assets are content-hashed, so
+          # nothing but the entry document can be stale — and CloudFront bills
+          # per invalidation PATH beyond 1,000 free per month. Two paths per
+          # merge stays free essentially forever; "/*" counts as one path but
+          # needlessly dumps the whole cache.
+          #
+          # "/" as well as "/index.html" because the SPA-router CloudFront
+          # function rewrites "/" to "/index.html" AFTER the cache lookup, so
+          # the two are separate cache entries.
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths /index.html / \
+            --query 'Invalidation.Id' --output text
+
+          echo "Deployed to \`$BUCKET\` and invalidated the CloudFront entry document." >> "$GITHUB_STEP_SUMMARY"
 
   # Fires a repository_dispatch at the gateway repo carrying the tag that was
   # just pushed. Separate job, same reasoning as bump-deployment elsewhere:
